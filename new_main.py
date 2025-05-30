@@ -4,9 +4,9 @@ from PIL import Image, ImageDraw
 from collections import defaultdict
 import json, random, sqlite3, asyncio
 
-API_ID = 20409913
-API_HASH = "7e5b7eb079ab46d84cde424962b020a0"
-BOT_TOKEN = "7904552484:AAEkRkT3URxLdUW0ZPTzgVlYRhW2Ra1RqSk"
+API_ID = 25605001
+API_HASH = "53937421988723a76c743219767efadf"
+BOT_TOKEN = "7661838649:AAEfhXrl3eoHwtkILJNvAlXkYTZpnds0eeU"
 
 bot = Client("snakeludo_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
