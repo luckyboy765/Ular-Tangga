@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# Hapus file gambar jika ada
+rm -f board.png current_board.png
+
+# Jalankan bot
+python3 new_main.py
