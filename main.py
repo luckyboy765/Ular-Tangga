@@ -448,8 +448,10 @@ async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, userna
             game["current_turn_index"] = (game["current_turn_index"] + 1) % len(game["game_turn_order"])
         next_uid = game["game_turn_order"][game["current_turn_index"]]
         user_obj = await bot.get_users(next_uid)
+        color = game["player_colors"].get(next_uid, "???")
+        emoji = COLOR_EMOJIS.get(color, color)
         mention = f"[{user_obj.first_name}](tg://user?id={next_uid})"
-        text += f"🎯 Giliran selanjutnya: {mention}"
+        text += f"🎯 Giliran selanjutnya: {mention} dengan pion {emoji}"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎲 Lempar Dadu", callback_data="roll")]])
 
     path = generate_board_image(game["player_positions"], game["player_colors"])
@@ -526,7 +528,7 @@ async def callback_query_handler(_, callback):
             for uid in game["game_turn_order"]
         ]
         players_text = "\n".join(player_lines)
-
+        random.shuffle(game["game_turn_order"])  # Acak urutan giliran
         first_uid = game["game_turn_order"][0]
         first_user = await bot.get_users(first_uid)
         first_color = game["player_colors"].get(first_uid, "???")
