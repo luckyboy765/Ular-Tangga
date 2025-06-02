@@ -402,6 +402,42 @@ async def remove_truth(_, message: Message):
     except:
         await message.reply("❌ Format: `/removetruth 1`")
 
+@bot.on_message(filters.command("adddare"))
+async def add_dare_prompt(_, message: Message):
+    if message.from_user.id not in OWNER_IDS:
+        return await message.reply("❌ Hanya owner yang bisa menambah dare.")
+    text = message.text[len("/adddare"):].strip()
+    if not text:
+        return await message.reply("❌ Format: `/adddare Dare: ...`")
+    cursor.execute("INSERT INTO truth_dare_global (type, prompt) VALUES (?, ?)", ('dare', text))
+    conn.commit()
+    await message.reply(f"✅ Dare ditambahkan: {text}")
+
+@bot.on_message(filters.command("listdare"))
+async def list_dare(_, message: Message):
+    _, dares = get_global_prompts()
+    if not dares:
+        return await message.reply("❌ Belum ada dare.")
+    text = "\n".join([f"{i+1}. {d}" for i, d in enumerate(dares)])
+    await message.reply(f"🎯 **Daftar Dare:**\n{text}")
+
+@bot.on_message(filters.command("removedare"))
+async def remove_dare(_, message: Message):
+    if message.from_user.id not in OWNER_IDS:
+        return await message.reply("❌ Hanya owner yang bisa menghapus dare.")
+    try:
+        index = int(message.text.split()[1]) - 1
+        _, dares = get_global_prompts()
+        if 0 <= index < len(dares):
+            removed = dares[index]
+            cursor.execute("DELETE FROM truth_dare_global WHERE type = ? AND prompt = ? LIMIT 1", ('dare', removed))
+            conn.commit()
+            await message.reply(f"✅ Dare dihapus: {removed}")
+        else:
+            await message.reply("❌ Nomor tidak valid.")
+    except:
+        await message.reply("❌ Format: `/removedare 1`")
+
 
 async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, username: str, callback_query=None):
     keyboard = None  
