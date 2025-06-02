@@ -81,8 +81,6 @@ async def set_commands():
         BotCommand("adddare", "Tambah tantangan dare"),
         BotCommand("removedare", "Hapus tantangan dare"),
         BotCommand("listdare", "Lihat daftar dare"),
-        BotCommand("settruthpos", "Atur posisi truth"),
-        BotCommand("setdarepos", "Atur posisi dare"),
         BotCommand("addadmin", "Tambah admin"),
         BotCommand("help", "Lihat bantuan")
     ]
@@ -117,6 +115,13 @@ CREATE TABLE IF NOT EXISTS scores (
 """)
 
 cursor.execute("""
+CREATE TABLE IF NOT EXISTS truth_dare_global (
+    type TEXT CHECK(type IN ('truth', 'dare')),
+    prompt TEXT
+)
+""")
+
+cursor.execute("""
 CREATE TABLE IF NOT EXISTS game_settings (
     chat_id INTEGER PRIMARY KEY,
     snakes TEXT DEFAULT '{}',
@@ -138,6 +143,7 @@ DEFAULT_DARE_POSITIONS = []
 DEFAULT_TRUTH_PROMPTS = []
 DEFAULT_DARE_PROMPTS = []
 
+
 COLOR_EMOJIS = {
     "red": "🔴",
     "blue": "🔵",
@@ -148,48 +154,51 @@ COLOR_EMOJIS = {
 BOARD_IMAGE_PATH = "boards.png"
 GRID_SIZE = 6
 
+def get_global_prompts():
+    cursor.execute("SELECT type, prompt FROM truth_dare_global")
+    rows = cursor.fetchall()
+    truths = [r[1] for r in rows if r[0] == 'truth']
+    dares = [r[1] for r in rows if r[0] == 'dare']
+    return truths, dares
+
+
 def get_chat_settings(chat_id):
     cursor.execute("SELECT * FROM game_settings WHERE chat_id = ?", (chat_id,))
     row = cursor.fetchone()
 
     if not row:
         cursor.execute("""
-            INSERT INTO game_settings (chat_id, snakes, ladders, truth_positions, dare_positions, truth_prompts, dare_prompts, admins)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO game_settings (chat_id, snakes, ladders, truth_positions, dare_positions, admins)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
             chat_id,
             json.dumps(DEFAULT_SNAKES),
             json.dumps(DEFAULT_LADDERS),
             json.dumps(DEFAULT_TRUTH_POSITIONS),
             json.dumps(DEFAULT_DARE_POSITIONS),
-            json.dumps(DEFAULT_TRUTH_PROMPTS),
-            json.dumps(DEFAULT_DARE_PROMPTS),
             json.dumps([]),
         ))
         conn.commit()
-        # Ambil ulang data yang baru dimasukkan
         cursor.execute("SELECT * FROM game_settings WHERE chat_id = ?", (chat_id,))
         row = cursor.fetchone()
 
-    # Tetapkan semua posisi statis, tapi gunakan data dinamis untuk prompts dan admin
+    truths, dares = get_global_prompts()
     return {
         'snakes': STATIC_SNAKES,
         'ladders': STATIC_LADDERS,
         'truth_positions': STATIC_TRUTH_POSITIONS,
         'dare_positions': STATIC_DARE_POSITIONS,
-        'truth_prompts': json.loads(row[5]) if row[5] else [],
-        'dare_prompts': json.loads(row[6]) if row[6] else [],
-        'admins': json.loads(row[7]) if row[7] else [],
+        'truth_prompts': truths,
+        'dare_prompts': dares,
+        'admins': OWNER_IDS,  # Admin tetap hanya OWNER_IDS
     }
-
 
 def update_chat_settings(chat_id, key, value):
     cursor.execute(f"UPDATE game_settings SET {key} = ? WHERE chat_id = ?", (json.dumps(value), chat_id))
     conn.commit()
 
 def is_admin(chat_id, user_id):
-    settings = get_chat_settings(chat_id)
-    return user_id in settings['admins']
+    return user_id in OWNER_IDS
 
 def pos_to_xy_grid(pos, width, height):
     square_w = width // GRID_SIZE
@@ -244,51 +253,6 @@ async def set_dare_positions(_, message: Message):
         await message.reply(f"✅ **Posisi Dare berhasil diatur:**\n{pos_text}")
     except:
         await message.reply("❌ Format salah. Gunakan: `/setdarepos 4 12 20 35`")
-
-@bot.on_message(filters.command("adddare"))
-async def add_dare_prompt(_, message: Message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    if not is_admin(chat_id, user_id):
-        await message.reply("❌ Hanya admin yang bisa menambah dare.")
-        return
-    prompt_text = message.text[len("/adddare"):].strip()
-    if not prompt_text:
-        await message.reply("❌ Masukkan teks dare. Format: `/adddare Dare: Contoh dare`")
-        return
-    settings = get_chat_settings(chat_id)
-    settings['dare_prompts'].append(prompt_text)
-    update_chat_settings(chat_id, 'dare_prompts', settings['dare_prompts'])
-    await message.reply(f"✅ Dare ditambahkan: {prompt_text}")
-
-@bot.on_message(filters.command("listdare"))
-async def list_dare(_, message: Message):
-    chat_id = message.chat.id
-    settings = get_chat_settings(chat_id)
-    if not settings['dare_prompts']:
-        await message.reply("❌ Belum ada dare.")
-        return
-    dare_list = "\n".join([f"{i+1}. {d}" for i, d in enumerate(settings['dare_prompts'])])
-    await message.reply(f"🎯 **Daftar Dare:**\n{dare_list}")
-
-@bot.on_message(filters.command("removedare"))
-async def remove_dare(_, message: Message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    if not is_admin(chat_id, user_id):
-        await message.reply("❌ Hanya admin yang bisa hapus dare.")
-        return
-    try:
-        index = int(message.text.split()[1]) - 1
-        settings = get_chat_settings(chat_id)
-        if 0 <= index < len(settings['dare_prompts']):
-            removed = settings['dare_prompts'].pop(index)
-            update_chat_settings(chat_id, 'dare_prompts', settings['dare_prompts'])
-            await message.reply(f"✅ Dare dihapus: {removed}")
-        else:
-            await message.reply("❌ Nomor tidak valid.")
-    except:
-        await message.reply("❌ Format salah. Gunakan: `/removedare 1`")
 
 @bot.on_message(filters.command("new"))
 async def new_game(_, message: Message):
@@ -401,6 +365,43 @@ async def start_game(_, message: Message):
     )
 
     await message.reply_photo(photo=path, caption=caption, reply_markup=keyboard)
+
+@bot.on_message(filters.command("addtruth"))
+async def add_truth_prompt(_, message: Message):
+    if message.from_user.id not in OWNER_IDS:
+        return await message.reply("❌ Hanya owner yang bisa menambah truth.")
+    text = message.text[len("/addtruth"):].strip()
+    if not text:
+        return await message.reply("❌ Format: `/addtruth Truth: ...`")
+    cursor.execute("INSERT INTO truth_dare_global (type, prompt) VALUES (?, ?)", ('truth', text))
+    conn.commit()
+    await message.reply(f"✅ Truth ditambahkan: {text}")
+
+@bot.on_message(filters.command("listtruth"))
+async def list_truth(_, message: Message):
+    truths, _ = get_global_prompts()
+    if not truths:
+        return await message.reply("❌ Belum ada truth.")
+    text = "\n".join([f"{i+1}. {t}" for i, t in enumerate(truths)])
+    await message.reply(f"🧠 **Daftar Truth:**\n{text}")
+
+@bot.on_message(filters.command("removetruth"))
+async def remove_truth(_, message: Message):
+    if message.from_user.id not in OWNER_IDS:
+        return await message.reply("❌ Hanya owner yang bisa menghapus truth.")
+    try:
+        index = int(message.text.split()[1]) - 1
+        truths, _ = get_global_prompts()
+        if 0 <= index < len(truths):
+            removed = truths[index]
+            cursor.execute("DELETE FROM truth_dare_global WHERE type = ? AND prompt = ? LIMIT 1", ('truth', removed))
+            conn.commit()
+            await message.reply(f"✅ Truth dihapus: {removed}")
+        else:
+            await message.reply("❌ Nomor tidak valid.")
+    except:
+        await message.reply("❌ Format: `/removetruth 1`")
+
 
 async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, username: str, callback_query=None):
     keyboard = None  
@@ -816,99 +817,6 @@ async def show_game_settings(_, message: Message):
 👑 **Jumlah Admin:** {admin_count}
 """
     await message.reply(settings_text)
-
-@bot.on_message(filters.command("addtruth"))
-async def add_truth_prompt(_, message: Message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    if not is_admin(chat_id, user_id):
-        await message.reply("❌ Hanya admin yang bisa menambah truth.")
-        return
-
-    prompt_text = message.text[len("/addtruth"):].strip()
-    if not prompt_text:
-        await message.reply("❌ Masukkan teks truth. Format: `/addtruth Truth: Siapa yang kamu suka?`")
-        return
-
-    settings = get_chat_settings(chat_id)
-    settings['truth_prompts'].append(prompt_text)
-    update_chat_settings(chat_id, 'truth_prompts', settings['truth_prompts'])
-    await message.reply(f"✅ Truth ditambahkan: {prompt_text}")
-
-@bot.on_message(filters.command("listtruth"))
-async def list_truth(_, message: Message):
-    chat_id = message.chat.id
-    settings = get_chat_settings(chat_id)
-    if not settings['truth_prompts']:
-        await message.reply("❌ Belum ada truth.")
-        return
-    truth_list = "\n".join([f"{i+1}. {q}" for i, q in enumerate(settings['truth_prompts'])])
-    await message.reply(f"🧠 **Daftar Truth:**\n{truth_list}")
-
-@bot.on_message(filters.command("removetruth"))
-async def remove_truth(_, message: Message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    if not is_admin(chat_id, user_id):
-        await message.reply("❌ Hanya admin yang bisa hapus truth.")
-        return
-
-    try:
-        index = int(message.text.split()[1]) - 1
-        settings = get_chat_settings(chat_id)
-        if 0 <= index < len(settings['truth_prompts']):
-            removed = settings['truth_prompts'].pop(index)
-            update_chat_settings(chat_id, 'truth_prompts', settings['truth_prompts'])
-            await message.reply(f"✅ Truth dihapus: {removed}")
-        else:
-            await message.reply("❌ Nomor tidak valid.")
-    except:
-        await message.reply("❌ Format salah. Gunakan: `/removetruth 1`")
-
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    if not is_admin(chat_id, user_id):
-        await message.reply("❌ Hanya admin yang bisa mengatur posisi truth.")
-        return
-
-    try:
-        args = message.text.split()[1:]
-        if not args:
-            settings = get_chat_settings(chat_id)
-            pos_text = ", ".join(map(str, settings['truth_positions']))
-            await message.reply(f"🧠 **Posisi Truth Saat Ini:**\n{pos_text}\n\n**Format:** `/settruthpos 3 17 25 33`")
-            return
-
-        new_positions = [int(arg) for arg in args if 1 <= int(arg) <= 36]
-        update_chat_settings(chat_id, 'truth_positions', new_positions)
-        pos_text = ", ".join(map(str, new_positions))
-        await message.reply(f"✅ **Posisi Truth berhasil diatur:**\n{pos_text}")
-
-    except Exception:
-        await message.reply("❌ Format salah. Gunakan: `/settruthpos 3 17 25 33`")
-
-# Tambahkan command /adddare
-@bot.on_message(filters.command("adddare"))
-async def add_dare_prompt(_, message: Message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    if not is_admin(chat_id, user_id):
-        await message.reply("❌ Hanya admin yang bisa menambah dare.")
-        return
-
-    prompt_text = message.text[len("/adddare"):].strip()
-    if not prompt_text:
-        await message.reply("❌ Masukkan teks dare. Format: `/adddare Dare: Contoh dare`")
-        return
-
-    settings = get_chat_settings(chat_id)
-    settings['dare_prompts'].append(prompt_text)
-    update_chat_settings(chat_id, 'dare_prompts', settings['dare_prompts'])
-    await message.reply(f"✅ Dare ditambahkan: {prompt_text}")
 
 @bot.on_message(filters.command("help"))
 async def show_help(_, message: Message):
