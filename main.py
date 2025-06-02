@@ -440,6 +440,15 @@ async def remove_dare(_, message: Message):
 
 
 async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, username: str, callback_query=None):
+    roll_key = f"rolllock:{chat_id}:{user_id}"
+    if not redis_client.set(roll_key, "1", nx=True, ex=5):
+        msg = "⏳ Sedang memproses giliranmu, tunggu sebentar..."
+        if callback_query:
+            await callback_query.answer(msg, show_alert=True)
+        else:
+            await bot.send_message(chat_id, msg)
+        return
+
     keyboard = None  
     game = get_or_create_game(chat_id)
 
@@ -584,6 +593,7 @@ async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, userna
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎲 Lempar Dadu", callback_data="roll")]])
 
     # PERBAIKAN: Simpan state game setelah semua perubahan
+    redis_client.delete(roll_key)
     set_game_state(chat_id, game)
 
     path = generate_board_image(game["player_positions"], game["player_colors"])
