@@ -1,3 +1,4 @@
 pyrotgfork[fast]
 pillow
 asyncpg
+redis
