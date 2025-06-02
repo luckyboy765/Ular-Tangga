@@ -1,11 +1,52 @@
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram import idle
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from PIL import Image, ImageDraw
 from collections import defaultdict
-import json, random, sqlite3, asyncio
 from config import OWNER_IDS, API_ID, API_HASH, BOT_TOKEN
 
+import json, random, sqlite3, asyncio
+import redis
+
+redis_client = redis.from_url("redis://default:cZ9PulRT47AsT9ZfYopsKgyLEREhoLiR@redis-14399.crce185.ap-seast-1-1.ec2.redns.redis-cloud.com:14399", decode_responses=True)
 bot = Client("snakeludo_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+def fix_game_data_types(game):
+    """Perbaiki tipe data yang tidak konsisten"""
+    # Convert string keys ke integer untuk player_positions dan player_colors
+    if game.get("player_positions"):
+        game["player_positions"] = {
+            int(k) if isinstance(k, str) else k: v 
+            for k, v in game["player_positions"].items()
+        }
+    
+    if game.get("player_colors"):
+        game["player_colors"] = {
+            int(k) if isinstance(k, str) else k: v 
+            for k, v in game["player_colors"].items()
+        }
+    
+    # Ensure game_turn_order contains integers
+    if game.get("game_turn_order"):
+        game["game_turn_order"] = [
+            int(uid) if isinstance(uid, str) else uid 
+            for uid in game["game_turn_order"]
+        ]
+    
+    return game
+
+def get_game_state(chat_id):
+    data = redis_client.get(f"game:{chat_id}")
+    if data:
+        game = json.loads(data)
+        return fix_game_data_types(game)
+    return None
+
+def set_game_state(chat_id, state):
+    redis_client.set(f"game:{chat_id}", json.dumps(state))
+
+def reset_game_state(chat_id):
+    redis_client.delete(f"game:{chat_id}")
 
 games = defaultdict(lambda: {
     "player_positions": {},
@@ -24,14 +65,33 @@ STATIC_TRUTH_POSITIONS = [3, 17, 25, 33]
 STATIC_DARE_POSITIONS = [4, 12, 20, 35]
 AVAILABLE_COLORS = ["red", "blue", "green", "yellow"]
 
-
-def reset_game_state(chat_id):
-    if chat_id in games:
-        games.pop(chat_id)
+async def set_commands():
+    commands = [
+        BotCommand("new", "Buat game baru"),
+        BotCommand("join", "Gabung ke game"),
+        BotCommand("start", "Mulai game"),
+        BotCommand("roll", "Lempar dadu"),
+        BotCommand("reset", "Reset game"),
+        BotCommand("kick", "Kick pemain"),
+        BotCommand("continue", "Lanjutkan giliran setelah tantangan"),
+        BotCommand("gamesettings", "Lihat pengaturan game"),
+        BotCommand("addtruth", "Tambah pertanyaan truth"),
+        BotCommand("removetruth", "Hapus pertanyaan truth"),
+        BotCommand("listtruth", "Lihat daftar truth"),
+        BotCommand("adddare", "Tambah tantangan dare"),
+        BotCommand("removedare", "Hapus tantangan dare"),
+        BotCommand("listdare", "Lihat daftar dare"),
+        BotCommand("settruthpos", "Atur posisi truth"),
+        BotCommand("setdarepos", "Atur posisi dare"),
+        BotCommand("addadmin", "Tambah admin"),
+        BotCommand("help", "Lihat bantuan")
+    ]
+    await bot.set_bot_commands(commands)
 
 def get_or_create_game(chat_id):
-    if chat_id not in games:
-        games[chat_id] = {
+    game = get_game_state(chat_id)
+    if not game:
+        game = {
             "player_positions": {},
             "player_colors": {},
             "game_turn_order": [],
@@ -42,7 +102,8 @@ def get_or_create_game(chat_id):
             "game_created": False,
             "available_colors": AVAILABLE_COLORS.copy()
         }
-    return games[chat_id]
+        set_game_state(chat_id, game)
+    return game
 
 conn = sqlite3.connect("score.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -84,7 +145,7 @@ COLOR_EMOJIS = {
     "yellow": "🟡"
 }
 
-BOARD_IMAGE_PATH = "board_fix.png"
+BOARD_IMAGE_PATH = "boards.png"
 GRID_SIZE = 6
 
 def get_chat_settings(chat_id):
@@ -239,11 +300,13 @@ async def new_game(_, message: Message):
         return
 
     game["game_created"] = True
+    set_game_state(chat_id, game)
     game["player_positions"].clear()
     game["player_colors"].clear()
     game["game_turn_order"].clear()
     game["winners"].clear()
     game["paused_for_challenge"] = False
+    set_game_state(chat_id, game)
     game["last_message_id"] = None
     game["current_turn_index"] = 0
     game["available_colors"] = AVAILABLE_COLORS.copy()
@@ -267,29 +330,48 @@ Gunakan tombol join untuk bergabung ke dalam permainan dan klik tombol start unt
 async def join_game(_, message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
-    game = get_or_create_game(chat_id)
 
-    if not game["game_created"]:
-        await message.reply("❌ Belum ada game yang dibuat. Gunakan /new dulu.")
+    # Gunakan lock yang sama dengan callback
+    join_key = f"joining:{chat_id}:{user_id}"
+    
+    if not redis_client.set(join_key, "1", nx=True, ex=5):
+        await message.reply("⏳ Sedang proses join, tunggu sebentar...")
         return
 
-    if user_id in game["player_positions"]:
-        await message.reply("Kamu sudah ikut bermain.")
-        return
+    try:
+        game = get_game_state(chat_id)
+        if not game:
+            game = get_or_create_game(chat_id)
 
-    if len(game["player_colors"]) >= 4:
-        await message.reply("⚠️ Pemain penuh (maks 4).")
-        return
+        if not game.get("game_created", False):
+            await message.reply("❌ Belum ada game yang dibuat. Gunakan /new dulu.")
+            return
 
-    if not game.get("available_colors"):
-        game["available_colors"] = AVAILABLE_COLORS.copy()
+        # Konsistensi tipe data - gunakan integer
+        if user_id in game["player_positions"]:
+            await message.reply("Kamu sudah ikut bermain.")
+            return
 
-    color = game["available_colors"].pop(0)
-    game["player_positions"][user_id] = 1
-    game["player_colors"][user_id] = color
-    game["game_turn_order"].append(user_id)
+        if len(game["player_colors"]) >= 4:
+            await message.reply("⚠️ Pemain penuh (maks 4).")
+            return
 
-    await message.reply(f"✅ Kamu bergabung sebagai pion **{color}**!")
+        if not game.get("available_colors"):
+            game["available_colors"] = AVAILABLE_COLORS.copy()
+
+        color = game["available_colors"].pop(0)
+        game["player_positions"][user_id] = 1  # Integer
+        game["player_colors"][user_id] = color  # Integer
+        game["game_turn_order"].append(user_id)
+        
+        set_game_state(chat_id, game)
+        await message.reply(f"✅ Kamu bergabung sebagai pion **{color}**!")
+        
+    except Exception as e:
+        await message.reply("❌ Terjadi error saat join. Coba lagi.")
+        print(f"Error in join command: {e}")
+    finally:
+        redis_client.delete(join_key)
 
 @bot.on_message(filters.command("start"))
 async def start_game(_, message: Message):
@@ -319,8 +401,6 @@ async def start_game(_, message: Message):
     )
 
     await message.reply_photo(photo=path, caption=caption, reply_markup=keyboard)
-
-
 
 async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, username: str, callback_query=None):
     keyboard = None  
@@ -373,6 +453,7 @@ async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, userna
         text += f"🪜 Kamu naik tangga! Naik dari {new_pos} ke {target}.\n"
         new_pos = target
 
+    # Kick pemain lain yang di posisi sama
     kicked = None
     for uid, pos in game["player_positions"].items():
         if uid != user_id and pos == new_pos:
@@ -381,13 +462,14 @@ async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, userna
 
     game["player_positions"][user_id] = new_pos
 
-    text = f"🎲 {first_name} mendapat angka: {roll}\n📍 Posisi: {current} ➡️ {new_pos}\n"
     if new_pos == current and roll > 0:
         text += "❗ Kamu butuh angka yang tepat untuk mencapai kotak 36.\n"
     if kicked:
         text += f"💥 Pemain lain ditendang ke kotak 1!\n"
 
     challenge_msg = None
+    
+    # Cek truth/dare challenge
     if new_pos in settings['truth_positions'] and settings['truth_prompts']:
         game["paused_for_challenge"] = True
         challenge = random.choice(settings['truth_prompts'])
@@ -396,6 +478,8 @@ async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, userna
         game["paused_for_challenge"] = True
         challenge = random.choice(settings['dare_prompts'])
         challenge_msg = f"🎯 **Dare Challenge untuk {first_name}:**\n{challenge}"
+    
+    # Cek apakah pemain menang (mencapai kotak 36)
     elif new_pos == 36:
         if user_id not in game["winners"]:
             game["winners"].append(user_id)
@@ -405,27 +489,28 @@ async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, userna
             user_obj = await bot.get_users(uid)
             text += f"{i}. {user_obj.first_name}\n"
 
+        # Hapus pemain yang menang dari game
         game["game_turn_order"].remove(user_id)
         game["player_positions"].pop(user_id, None)
         color = game["player_colors"].pop(user_id, None)
         if color:
             game["available_colors"].append(color)
 
+        # Update skor
         cursor.execute("INSERT OR IGNORE INTO scores (user_id, username, wins) VALUES (?, ?, 0)", (user_id, username))
         cursor.execute("UPDATE scores SET wins = wins + 1 WHERE user_id = ?", (user_id,))
         conn.commit()
 
-        if len(game["game_turn_order"]) == 1:
-            last_uid = game["game_turn_order"][0]
-            if last_uid not in game["winners"]:
-                game["winners"].append(last_uid)
-
-            last_user = await bot.get_users(last_uid)
-            last_name = last_user.first_name
-
-            cursor.execute("INSERT OR IGNORE INTO scores (user_id, username, wins) VALUES (?, ?, 0)", (last_uid, last_name))
-            cursor.execute("UPDATE scores SET wins = wins + 1 WHERE user_id = ?", (last_uid,))
-            conn.commit()
+        # Cek apakah game selesai
+        if len(game["game_turn_order"]) <= 1:
+            if len(game["game_turn_order"]) == 1:
+                last_uid = game["game_turn_order"][0]
+                if last_uid not in game["winners"]:
+                    game["winners"].append(last_uid)
+                    last_user = await bot.get_users(last_uid)
+                    cursor.execute("INSERT OR IGNORE INTO scores (user_id, username, wins) VALUES (?, ?, 0)", (last_uid, last_user.first_name))
+                    cursor.execute("UPDATE scores SET wins = wins + 1 WHERE user_id = ?", (last_uid,))
+                    conn.commit()
 
             text += "\n🏁 Game selesai! Urutan pemenang:\n"
             for i, uid in enumerate(game["winners"], 1):
@@ -435,17 +520,24 @@ async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, userna
             reset_game_state(chat_id)
             keyboard = None
         else:
-            game["current_turn_index"] %= len(game["game_turn_order"])
+            # PERBAIKAN: Adjust current_turn_index setelah pemain dihapus
+            if game["current_turn_index"] >= len(game["game_turn_order"]):
+                game["current_turn_index"] = 0
+            
             next_uid = game["game_turn_order"][game["current_turn_index"]]
             user_obj = await bot.get_users(next_uid)
             color = game["player_colors"].get(next_uid, "???")
             emoji = COLOR_EMOJIS.get(color, color)
             mention = f"[{user_obj.first_name}](tg://user?id={next_uid})"
-            text = f"🎯 Giliran selanjutnya: {mention} dengan pion {emoji}"
+            text += f"\n🎯 Giliran selanjutnya: {mention} dengan pion {emoji}"
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎲 Lempar Dadu", callback_data="roll")]])
+    
+    # PERBAIKAN UTAMA: Pergantian giliran normal
     else:
+        # Jika tidak ada challenge dan tidak menang, ganti giliran
         if not game["paused_for_challenge"]:
             game["current_turn_index"] = (game["current_turn_index"] + 1) % len(game["game_turn_order"])
+            
         next_uid = game["game_turn_order"][game["current_turn_index"]]
         user_obj = await bot.get_users(next_uid)
         color = game["player_colors"].get(next_uid, "???")
@@ -453,6 +545,9 @@ async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, userna
         mention = f"[{user_obj.first_name}](tg://user?id={next_uid})"
         text += f"🎯 Giliran selanjutnya: {mention} dengan pion {emoji}"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎲 Lempar Dadu", callback_data="roll")]])
+
+    # PERBAIKAN: Simpan state game setelah semua perubahan
+    set_game_state(chat_id, game)
 
     path = generate_board_image(game["player_positions"], game["player_colors"])
 
@@ -464,11 +559,14 @@ async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, userna
 
     sent = await bot.send_photo(chat_id, photo=path, caption=text, reply_markup=keyboard)
     game["last_message_id"] = sent.id
+    
+    # PERBAIKAN: Simpan lagi setelah update message_id
+    set_game_state(chat_id, game)
 
     if challenge_msg:
         msg = await bot.send_message(chat_id, challenge_msg)
         game["challenge_message_id"] = msg.id
-
+        set_game_state(chat_id, game)
 
 # Command /roll
 @bot.on_message(filters.command("roll"))
@@ -480,31 +578,72 @@ async def roll_dice(_, message: Message):
 async def callback_query_handler(_, callback):
     chat_id = callback.message.chat.id
     user_id = callback.from_user.id
-    game = get_or_create_game(chat_id)
-
+    
     if callback.data == "join":
-        if not game["game_created"]:
-            await callback.answer("❌ Belum ada game.", show_alert=True)
-            return
+        # PERBAIKAN 1: Gunakan lock yang lebih ketat
+        join_key = f"joining:{chat_id}:{user_id}"
+        
+        # PERBAIKAN 2: Gunakan pipeline Redis untuk atomic operation
+        pipe = redis_client.pipeline()
+        
+        try:
+            # Set lock dengan waktu lebih lama dan cek apakah berhasil
+            if not redis_client.set(join_key, "1", nx=True, ex=5):
+                await callback.answer("⏳ Sedang proses join, tunggu sebentar...", show_alert=True)
+                return
+            
+            # PERBAIKAN 3: Ambil dan update game state secara atomic
+            game = get_game_state(chat_id)
+            if not game:
+                game = get_or_create_game(chat_id)
 
-        if user_id in game["player_positions"]:
-            await callback.answer("Kamu sudah ikut bermain.", show_alert=True)
-            return
+            if not game.get("game_created", False):
+                await callback.answer("❌ Game belum dibuat. Gunakan /new dulu.", show_alert=True)
+                redis_client.delete(join_key)
+                return
 
-        if len(game["player_colors"]) >= 4:
-            await callback.answer("⚠️ Pemain penuh (maks 4).", show_alert=True)
-            return
+            # PERBAIKAN 4: Konsistensi tipe data - gunakan integer
+            if user_id in game["player_positions"]:
+                await callback.answer("Kamu sudah ikut bermain.", show_alert=True)
+                redis_client.delete(join_key)
+                return
 
-        if not game.get("available_colors"):
-            game["available_colors"] = AVAILABLE_COLORS.copy()
+            if len(game["player_colors"]) >= 4:
+                await callback.answer("⚠️ Pemain penuh (maks 4).", show_alert=True)
+                redis_client.delete(join_key)
+                return
 
-        color = game["available_colors"].pop(0)
-        game["player_positions"][user_id] = 1
-        game["player_colors"][user_id] = color
-        game["game_turn_order"].append(user_id)
+            # PERBAIKAN 5: Pastikan available_colors ada
+            if not game.get("available_colors"):
+                game["available_colors"] = AVAILABLE_COLORS.copy()
 
-        await callback.answer(f"✅ Kamu bergabung sebagai pion {color}!")
-        await callback.message.reply(f"👤 {callback.from_user.first_name} bergabung sebagai pion **{color}**!")
+            if not game["available_colors"]:
+                await callback.answer("❌ Tidak ada warna tersedia.", show_alert=True)
+                redis_client.delete(join_key)
+                return
+
+            # PERBAIKAN 6: Gunakan integer konsisten untuk user_id
+            color = game["available_colors"].pop(0)
+            game["player_positions"][user_id] = 1  # Integer, bukan string
+            game["player_colors"][user_id] = color  # Integer, bukan string
+            game["game_turn_order"].append(user_id)  # Integer
+
+            # PERBAIKAN 7: Update state dan hapus lock dalam satu operasi
+            set_game_state(chat_id, game)
+            redis_client.delete(join_key)
+
+            await callback.answer(f"✅ Kamu bergabung sebagai pion {color}!")
+            
+            # Kirim konfirmasi ke grup
+            emoji = COLOR_EMOJIS.get(color, color)
+            await callback.message.reply(f"👤 {callback.from_user.first_name} bergabung sebagai pion {emoji}!")
+            
+        except Exception as e:
+            # PERBAIKAN 8: Error handling yang lebih baik
+            redis_client.delete(join_key)
+            await callback.answer("❌ Terjadi error saat join. Coba lagi.", show_alert=True)
+            print(f"Error in join callback: {e}")
+
     
     elif callback.data == "roll":
         user = callback.from_user
@@ -512,6 +651,9 @@ async def callback_query_handler(_, callback):
 
 
     elif callback.data == "start":
+        # FIX: Definisikan game variable di awal
+        game = get_or_create_game(chat_id)
+        
         if not game["game_created"]:
             await callback.answer("❌ Belum ada game.", show_alert=True)
             return
@@ -529,6 +671,7 @@ async def callback_query_handler(_, callback):
         ]
         players_text = "\n".join(player_lines)
         random.shuffle(game["game_turn_order"])  # Acak urutan giliran
+        set_game_state(chat_id, game)
         first_uid = game["game_turn_order"][0]
         first_user = await bot.get_users(first_uid)
         first_color = game["player_colors"].get(first_uid, "???")
@@ -542,7 +685,15 @@ async def callback_query_handler(_, callback):
 
         sent = await callback.message.reply_photo(photo=path, caption=caption, reply_markup=keyboard)
         game["last_message_id"] = sent.id
+        set_game_state(chat_id, game)  # Save the updated game state
         await callback.answer()
+        
+    elif callback.data == "delete_room":
+        # FIX: Definisikan game variable di awal  
+        game = get_or_create_game(chat_id)
+        reset_game_state(chat_id)
+        await callback.message.delete()
+        await callback.answer("🗑️ Ruang permainan telah dihapus!")
 
 @bot.on_message(filters.command("reset"))
 async def reset_game(_, message: Message):
@@ -553,12 +704,7 @@ async def reset_game(_, message: Message):
 @bot.on_message(filters.command("kick"))
 async def kick_player(_, message: Message):
     chat_id = message.chat.id
-    user_id = message.from_user.id
     game = get_or_create_game(chat_id)
-
-    if not is_admin(chat_id, user_id):
-        await message.reply("❌ Hanya admin yang bisa kick pemain.")
-        return
 
     if not message.reply_to_message:
         await message.reply("❌ Reply ke pesan pemain yang ingin di-kick.")
@@ -572,6 +718,7 @@ async def kick_player(_, message: Message):
 
     color = game["player_colors"].pop(target_id, None)
     game["player_positions"].pop(target_id, None)
+    set_game_state(chat_id, game)
     if target_id in game["game_turn_order"]:
         was_turn = game["game_turn_order"][game["current_turn_index"]] == target_id
         game["game_turn_order"].remove(target_id)
@@ -623,6 +770,7 @@ async def check_if_game_over(chat_id):
 
     if len(game["game_turn_order"]) == 1:
         game["paused_for_challenge"] = False
+        set_game_state(chat_id, game)
 
         winner_id = game["game_turn_order"][0]
         winner_user = await bot.get_users(winner_id)
@@ -668,69 +816,6 @@ async def show_game_settings(_, message: Message):
 👑 **Jumlah Admin:** {admin_count}
 """
     await message.reply(settings_text)
-
-# @bot.on_message(filters.command("setsnakes"))
-# async def set_snakes(_, message: Message):
-#     chat_id = message.chat.id
-#     user_id = message.from_user.id
-
-#     if not is_admin(chat_id, user_id):
-#         await message.reply("❌ Hanya admin yang bisa mengatur posisi ular.")
-#         return
-
-#     try:
-#         args = message.text.split()[1:]
-#         if not args:
-#             settings = get_chat_settings(chat_id)
-#             snake_text = "\n".join([f"{start} → {end}" for start, end in settings['snakes'].items()])
-#             await message.reply(f"🐍 **Posisi Ular Saat Ini:**\n{snake_text}\n\n**Format:** `/setsnakes 27:11 32:19`")
-#             return
-
-#         new_snakes = {}
-#         for arg in args:
-#             if ':' in arg:
-#                 start, end = map(int, arg.split(':'))
-#                 if 1 <= start <= 36 and 1 <= end <= 36 and start != end:
-#                     new_snakes[start] = end
-
-#         update_chat_settings(chat_id, 'snakes', new_snakes)
-#         snake_text = "\n".join([f"{start} → {end}" for start, end in new_snakes.items()])
-#         await message.reply(f"✅ **Ular berhasil diatur:**\n{snake_text}")
-
-#     except Exception:
-#         await message.reply("❌ Format salah. Gunakan: `/setsnakes 27:11 32:19`")
-
-# Tambahkan command /setladders
-# @bot.on_message(filters.command("setladders"))
-# async def set_ladders(_, message: Message):
-#     chat_id = message.chat.id
-#     user_id = message.from_user.id
-
-#     if not is_admin(chat_id, user_id):
-#         await message.reply("❌ Hanya admin yang bisa mengatur posisi tangga.")
-#         return
-
-#     try:
-#         args = message.text.split()[1:]
-#         if not args:
-#             settings = get_chat_settings(chat_id)
-#             ladder_text = "\n".join([f"{start} → {end}" for start, end in settings['ladders'].items()])
-#             await message.reply(f"🪜 **Posisi Tangga Saat Ini:**\n{ladder_text}\n\n**Format:** `/setladders 8:21 24:35`")
-#             return
-
-#         new_ladders = {}
-#         for arg in args:
-#             if ':' in arg:
-#                 start, end = map(int, arg.split(':'))
-#                 if 1 <= start <= 36 and 1 <= end <= 36 and start != end:
-#                     new_ladders[start] = end
-
-#         update_chat_settings(chat_id, 'ladders', new_ladders)
-#         ladder_text = "\n".join([f"{start} → {end}" for start, end in new_ladders.items()])
-#         await message.reply(f"✅ **Tangga berhasil diatur:**\n{ladder_text}")
-
-#     except Exception:
-#         await message.reply("❌ Format salah. Gunakan: `/setladders 8:21 24:35`")
 
 @bot.on_message(filters.command("addtruth"))
 async def add_truth_prompt(_, message: Message):
@@ -782,8 +867,6 @@ async def remove_truth(_, message: Message):
     except:
         await message.reply("❌ Format salah. Gunakan: `/removetruth 1`")
 
-# @bot.on_message(filters.command("settruthpos"))
-# async def set_truth_positions(_, message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
@@ -806,31 +889,6 @@ async def remove_truth(_, message: Message):
 
     except Exception:
         await message.reply("❌ Format salah. Gunakan: `/settruthpos 3 17 25 33`")
-
-# @bot.on_message(filters.command("setdarepos"))
-# async def set_dare_positions(_, message: Message):
-#     chat_id = message.chat.id
-#     user_id = message.from_user.id
-
-#     if not is_admin(chat_id, user_id):
-#         await message.reply("❌ Hanya admin yang bisa mengatur posisi dare.")
-#         return
-
-#     try:
-#         args = message.text.split()[1:]
-#         if not args:
-#             settings = get_chat_settings(chat_id)
-#             pos_text = ", ".join(map(str, settings['dare_positions']))
-#             await message.reply(f"🎯 **Posisi Dare Saat Ini:**\n{pos_text}\n\n**Format:** `/setdarepos 4 12 20 35`")
-#             return
-
-#         new_positions = [int(arg) for arg in args if 1 <= int(arg) <= 36]
-#         update_chat_settings(chat_id, 'dare_positions', new_positions)
-#         pos_text = ", ".join(map(str, new_positions))
-#         await message.reply(f"✅ **Posisi Dare berhasil diatur:**\n{pos_text}")
-
-#     except Exception:
-#         await message.reply("❌ Format salah. Gunakan: `/setdarepos 4 12 20 35`")
 
 # Tambahkan command /adddare
 @bot.on_message(filters.command("adddare"))
@@ -897,8 +955,12 @@ async def handle_challenge_reply(_, message: Message):
         game["paused_for_challenge"] = False
         game["challenge_message_id"] = None
 
-        # Lanjutkan giliran ke pemain berikutnya
+        # PERBAIKAN: Lanjutkan giliran ke pemain berikutnya
         game["current_turn_index"] = (game["current_turn_index"] + 1) % len(game["game_turn_order"])
+        
+        # PERBAIKAN: Simpan state setelah pergantian giliran
+        set_game_state(chat_id, game)
+        
         next_uid = game["game_turn_order"][game["current_turn_index"]]
         user_obj = await bot.get_users(next_uid)
         color = game["player_colors"].get(next_uid, "???")
@@ -917,6 +979,17 @@ async def handle_challenge_reply(_, message: Message):
 
         sent = await bot.send_photo(chat_id, photo=path, caption=text, reply_markup=keyboard)
         game["last_message_id"] = sent.id
+        
+        # PERBAIKAN: Simpan state terakhir
+        set_game_state(chat_id, game)
 
 
-bot.run()
+async def main():
+    await bot.start()
+    await set_commands()
+    print("🤖 Bot aktif dan menunggu...")
+    await idle()
+    await bot.stop()
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
