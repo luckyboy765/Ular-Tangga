@@ -3,10 +3,14 @@ from pyrogram import idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from PIL import Image, ImageDraw
 from collections import defaultdict
-from config import OWNER_IDS, API_ID, API_HASH, BOT_TOKEN
+from config import OWNER_IDS, API_ID, API_HASH, BOT_TOKEN, BACKUP_GROUP_ID
 
 import json, random, sqlite3, asyncio
 import redis
+import os
+import shutil
+from datetime import datetime, timedelta
+import pytz
 
 redis_client = redis.from_url("redis://default:cZ9PulRT47AsT9ZfYopsKgyLEREhoLiR@redis-14399.crce185.ap-seast-1-1.ec2.redns.redis-cloud.com:14399", decode_responses=True)
 bot = Client("snakeludo_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -172,10 +176,10 @@ def get_chat_settings(chat_id):
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
             chat_id,
-            json.dumps(DEFAULT_SNAKES),
-            json.dumps(DEFAULT_LADDERS),
-            json.dumps(DEFAULT_TRUTH_POSITIONS),
-            json.dumps(DEFAULT_DARE_POSITIONS),
+            json.dumps(STATIC_SNAKES),  # Gunakan STATIC_SNAKES
+            json.dumps(STATIC_LADDERS), # Gunakan STATIC_LADDERS
+            json.dumps(STATIC_TRUTH_POSITIONS),
+            json.dumps(STATIC_DARE_POSITIONS),
             json.dumps([]),
         ))
         conn.commit()
@@ -183,14 +187,19 @@ def get_chat_settings(chat_id):
         row = cursor.fetchone()
 
     truths, dares = get_global_prompts()
+    
+    # Parse data dari database, jika kosong gunakan static
+    saved_snakes = json.loads(row[1]) if row[1] and row[1] != '{}' else STATIC_SNAKES
+    saved_ladders = json.loads(row[2]) if row[2] and row[2] != '{}' else STATIC_LADDERS
+    
     return {
-        'snakes': STATIC_SNAKES,
-        'ladders': STATIC_LADDERS,
+        'snakes': saved_snakes,
+        'ladders': saved_ladders,
         'truth_positions': STATIC_TRUTH_POSITIONS,
         'dare_positions': STATIC_DARE_POSITIONS,
         'truth_prompts': truths,
         'dare_prompts': dares,
-        'admins': OWNER_IDS,  # Admin tetap hanya OWNER_IDS
+        'admins': OWNER_IDS,
     }
 
 def update_chat_settings(chat_id, key, value):
@@ -487,8 +496,9 @@ async def roll_dice_for_user(user_id: int, chat_id: int, first_name: str, userna
     text = f"🎲 {first_name} mendapat angka: {roll}\n📍 Posisi: {current} ➡️ {new_pos}\n"
 
     settings = get_chat_settings(chat_id)
-    snakes = {int(k): v for k, v in settings['snakes'].items()}
-    ladders = {int(k): v for k, v in settings['ladders'].items()}
+    # PERBAIKAN: Pastikan konversi ke integer konsisten
+    snakes = {int(k): int(v) for k, v in settings['snakes'].items()}
+    ladders = {int(k): int(v) for k, v in settings['ladders'].items()}
 
     if new_pos in snakes:
         target = snakes[new_pos]
@@ -938,10 +948,155 @@ async def handle_challenge_reply(_, message: Message):
         set_game_state(chat_id, game)
 
 
+async def backup_database():
+    """Backup database SQLite setiap jam 00:00 WIB dan kirim ke group"""
+    try:
+        # Tutup koneksi database sementara untuk backup
+        conn.close()
+        
+        # Buat folder backup sementara
+        temp_backup_dir = "temp_backup"
+        if not os.path.exists(temp_backup_dir):
+            os.makedirs(temp_backup_dir)
+        
+        # Format nama file backup dengan timestamp
+        wib_tz = pytz.timezone('Asia/Jakarta')
+        current_time = datetime.now(wib_tz)
+        backup_filename = f"score_backup_{current_time.strftime('%Y%m%d_%H%M%S')}.db"
+        backup_path = os.path.join(temp_backup_dir, backup_filename)
+        
+        # Copy database file
+        shutil.copy2("score.db", backup_path)
+        
+        # Buka kembali koneksi database
+        global conn, cursor
+        conn = sqlite3.connect("score.db", check_same_thread=False)
+        cursor = conn.cursor()
+        
+        # Kirim file backup ke group
+        file_size = os.path.getsize(backup_path)
+        size_kb = file_size / 1024
+        
+        caption = f"""🗄️ **Daily Database Backup**
+        
+📅 **Tanggal:** {current_time.strftime('%d/%m/%Y')}
+⏰ **Waktu:** {current_time.strftime('%H:%M:%S')} WIB
+📊 **Ukuran:** {size_kb:.2f} KB
+📁 **File:** `{backup_filename}`
+
+✅ Backup berhasil dibuat dan disimpan otomatis."""
+
+        await bot.send_document(
+            chat_id=BACKUP_GROUP_ID,
+            document=backup_path,
+            caption=caption
+        )
+        
+        print(f"✅ Database backup berhasil dan dikirim ke group: {backup_filename}")
+        
+        # Hapus file backup sementara
+        os.remove(backup_path)
+        
+        # Kirim notifikasi ke owner juga (opsional)
+        for owner_id in OWNER_IDS:
+            try:
+                await bot.send_message(
+                    owner_id, 
+                    f"🗄️ **Database Backup**\n"
+                    f"✅ Backup berhasil dibuat dan dikirim ke group log\n"
+                    f"📁 File: `{backup_filename}`\n"
+                    f"⏰ Waktu: {current_time.strftime('%d/%m/%Y %H:%M:%S')} WIB"
+                )
+            except Exception as e:
+                print(f"Gagal kirim notifikasi backup ke {owner_id}: {e}")
+                
+    except Exception as e:
+        print(f"❌ Error saat backup database: {e}")
+        
+        # Kirim notifikasi error ke group
+        try:
+            error_msg = f"❌ **Database Backup Error**\n\n"
+            error_msg += f"⏰ Waktu: {datetime.now(pytz.timezone('Asia/Jakarta')).strftime('%d/%m/%Y %H:%M:%S')} WIB\n"
+            error_msg += f"🐛 Error: `{str(e)}`"
+            
+            await bot.send_message(BACKUP_GROUP_ID, error_msg)
+        except:
+            pass
+            
+        # Pastikan koneksi database tetap terbuka meski backup gagal
+        try:
+            global conn, cursor
+            conn = sqlite3.connect("score.db", check_same_thread=False)
+            cursor = conn.cursor()
+        except:
+            pass
+
+async def schedule_daily_backup():
+    """Scheduler untuk backup harian jam 00:00 WIB"""
+    wib_tz = pytz.timezone('Asia/Jakarta')
+    
+    while True:
+        try:
+            now = datetime.now(wib_tz)
+            
+            # Hitung waktu sampai jam 00:00 berikutnya
+            tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            seconds_until_midnight = (tomorrow - now).total_seconds()
+            
+            print(f"⏰ Backup berikutnya dalam {seconds_until_midnight/3600:.1f} jam")
+            
+            # Tunggu sampai jam 00:00
+            await asyncio.sleep(seconds_until_midnight)
+            
+            # Jalankan backup
+            await backup_database()
+            
+        except Exception as e:
+            print(f"Error di scheduler backup: {e}")
+            # Tunggu 1 jam jika ada error
+            await asyncio.sleep(3600)
+
+# Fungsi untuk kirim statistik harian ke group log
+async def send_daily_stats():
+    """Kirim statistik harian ke group log"""
+    try:
+        wib_tz = pytz.timezone('Asia/Jakarta')
+        today = datetime.now(wib_tz)
+        
+        # Ambil data statistik dari database
+        cursor.execute("SELECT COUNT(*) FROM scores")
+        total_users = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT SUM(wins) FROM scores")
+        total_games = cursor.fetchone()[0] or 0
+        
+        cursor.execute("SELECT username, wins FROM scores ORDER BY wins DESC LIMIT 5")
+        top_players = cursor.fetchall()
+        
+        stats_msg = f"📊 **Daily Statistics**\n\n"
+        stats_msg += f"📅 **Tanggal:** {today.strftime('%d/%m/%Y')}\n"
+        stats_msg += f"👥 **Total Users:** {total_users}\n"
+        stats_msg += f"🎮 **Total Games:** {total_games}\n\n"
+        
+        if top_players:
+            stats_msg += "🏆 **Top 5 Players:**\n"
+            for i, (username, wins) in enumerate(top_players, 1):
+                stats_msg += f"{i}. {username} - {wins} wins\n"
+        
+        await bot.send_message(BACKUP_GROUP_ID, stats_msg)
+        
+    except Exception as e:
+        print(f"Error send daily stats: {e}")
+
 async def main():
     await bot.start()
     await set_commands()
+    
+    # Jalankan scheduler backup di background
+    asyncio.create_task(schedule_daily_backup())
+    
     print("🤖 Bot aktif dan menunggu...")
+    print(f"🗄️ Auto backup scheduler aktif (00:00 WIB) -> Group: {BACKUP_GROUP_ID}")
     await idle()
     await bot.stop()
 
