@@ -950,6 +950,8 @@ async def handle_challenge_reply(_, message: Message):
 
 async def backup_database():
     """Backup database SQLite setiap jam 00:00 WIB dan kirim ke group"""
+    global conn, cursor
+    
     try:
         # Tutup koneksi database sementara untuk backup
         conn.close()
@@ -969,7 +971,6 @@ async def backup_database():
         shutil.copy2("score.db", backup_path)
         
         # Buka kembali koneksi database
-        global conn, cursor
         conn = sqlite3.connect("score.db", check_same_thread=False)
         cursor = conn.cursor()
         
@@ -1025,7 +1026,6 @@ async def backup_database():
             
         # Pastikan koneksi database tetap terbuka meski backup gagal
         try:
-            global conn, cursor
             conn = sqlite3.connect("score.db", check_same_thread=False)
             cursor = conn.cursor()
         except:
