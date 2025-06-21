@@ -63,7 +63,7 @@ games = defaultdict(lambda: {
     "game_created": False
 })
 
-STATIC_SNAKES = {16: 3, 29: 15, 32:29, 34:28}
+STATIC_SNAKES = {16: 3, 29: 15, 32:19, 34:28}
 STATIC_LADDERS = {6:17, 11:24, 14:27, 23:26}
 STATIC_TRUTH_POSITIONS = [3, 17, 25, 33]
 STATIC_DARE_POSITIONS = [4, 12, 20, 35]
@@ -285,11 +285,13 @@ async def new_game(_, message: Message):
     game["available_colors"] = AVAILABLE_COLORS.copy()
 
     text = """**Ruang bermain berhasil dibuat.**
-Gunakan tombol join untuk bergabung ke dalam permainan dan klik tombol start untuk memulai permainan.
+Gunakan tombol Gabung atau ketik /join untuk bergabung ke dalam permainan dan klik tombol start atau ketik /start untuk memulai permainan.
 
 **Catatan:**
-(1) Ruang bermain akan otomatis dihapus setelah saat permainan berakhir.
-(2) Maksimal pemain yang dapat bergabung dalam ruang bermain adalah 4 orang dan permainan akan otomatis dimulai apabila pemain ke-4 telah memasuki ruang bermain."""
+(1) Bila bidak menumpuk atau menabrak bidak lain di angka yang sama makan akan mati dan memulai dari awal.
+(2) Bila terkena tantangan TRUTH reply pertanyaan yang diberikan dengan jawaban yang sesuai.
+(3) Bila terkena hukuman DARE selesaikan hukuman yang diberikan dan Reply hukuman dengan DONE/SELESAI.
+(4) Jumlah minimal pemain untuk memulai adalah 2 orang dan jumlah Maksimal pemain yang dapat bergabung dalam ruang bermain adalah 4 orang."""
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Gabung permainan", callback_data="join")],
